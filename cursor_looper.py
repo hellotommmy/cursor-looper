@@ -1,249 +1,160 @@
 """
-Cursor Looper - Auto-repeat instructions for Cursor AI
+Cursor Looper - Auto-repeat prompts via Cursor CLI agent.
 
-Monitors workspace file changes. When AI finishes (folder goes idle),
-automatically re-sends the same instruction.
+Runs `cursor agent -p <prompt>` in a loop. Each invocation is a full
+agent session that exits on completion; the script simply re-launches it.
 """
 
-import time
-import os
+import subprocess
 import sys
-import threading
+import time
 import argparse
-from pathlib import Path
-
-try:
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
-except ImportError:
-    print("Missing dependency: watchdog. Run: pip install watchdog")
-    sys.exit(1)
-
-try:
-    import pyautogui
-except ImportError:
-    print("Missing dependency: pyautogui. Run: pip install pyautogui")
-    sys.exit(1)
-
-try:
-    import pyperclip
-except ImportError:
-    print("Missing dependency: pyperclip. Run: pip install pyperclip")
-    sys.exit(1)
+import os
 
 
-IGNORE_PATTERNS = {
-    '.git', '__pycache__', 'node_modules', '.cursor',
-    '.vscode', '.idea', '.DS_Store', 'Thumbs.db',
-}
-
-
-class ChangeDetector(FileSystemEventHandler):
-
-    def __init__(self):
-        self.last_change_time = 0.0
-        self.change_count = 0
-        self.lock = threading.Lock()
-
-    def _should_ignore(self, path: str) -> bool:
-        parts = Path(path).parts
-        return any(p in IGNORE_PATTERNS for p in parts)
-
-    def on_any_event(self, event):
-        if self._should_ignore(event.src_path):
-            return
-        with self.lock:
-            self.last_change_time = time.time()
-            self.change_count += 1
-
-    def reset(self):
-        with self.lock:
-            self.last_change_time = 0.0
-            self.change_count = 0
-
-    @property
-    def has_activity(self):
-        with self.lock:
-            return self.change_count > 0
-
-    def seconds_since_last_change(self):
-        with self.lock:
-            if self.last_change_time == 0:
-                return float('inf')
-            return time.time() - self.last_change_time
-
-
-def send_to_cursor(instruction: str, hotkey: str = "ctrl+l", delay: float = 1.0):
-    """Send instruction to Cursor chat via keyboard automation."""
-    pyperclip.copy(instruction)
-    time.sleep(0.3)
-
-    keys = hotkey.split('+')
-    pyautogui.hotkey(*keys)
-    time.sleep(delay)
-
-    pyautogui.hotkey('ctrl', 'a')
-    time.sleep(0.1)
-    pyautogui.hotkey('ctrl', 'v')
-    time.sleep(0.3)
-
-    pyautogui.hotkey('enter')
-
-
-def wait_for_ai_start(detector: ChangeDetector, timeout: int = 120):
-    """Wait until file changes are detected (AI starts working)."""
-    start = time.time()
-    while not detector.has_activity:
-        time.sleep(0.5)
-        elapsed = time.time() - start
-        if elapsed > timeout:
-            print(f"  [TIMEOUT] No file changes after {timeout}s, moving on...")
-            return False
-        if int(elapsed) % 10 == 0 and int(elapsed) > 0:
-            remaining = timeout - int(elapsed)
-            if remaining % 10 == 0:
-                print(f"  Waiting for AI to start... ({int(elapsed)}s / {timeout}s)")
-    return True
-
-
-def wait_for_ai_finish(detector: ChangeDetector, idle_timeout: int = 30):
-    """Wait until folder is idle for idle_timeout seconds (AI finished)."""
-    while True:
-        time.sleep(1)
-        gap = detector.seconds_since_last_change()
-        if gap >= idle_timeout:
-            return
+def run_agent_once(prompt: str, workspace: str, extra_args: list[str]) -> int:
+    """Run one `cursor agent -p <prompt>` session, return exit code."""
+    cmd = ["cursor", "agent", "-p", prompt] + extra_args
+    result = subprocess.run(cmd, cwd=workspace)
+    return result.returncode
 
 
 def print_banner():
     print("")
     print("  +==========================================+")
-    print("  |        Cursor Looper v1.0                |")
-    print("  |   Auto-repeat instructions for Cursor AI |")
+    print("  |        Cursor Looper v2.0                |")
+    print("  |   Auto-repeat prompts for Cursor Agent   |")
     print("  +==========================================+")
     print("")
 
 
-def interactive_loop(workspace: str, idle_timeout: int, hotkey: str,
-                     start_wait: int, send_delay: float):
-    """Main interactive loop: user enters instruction, tool repeats it."""
+def interactive_loop(workspace: str, pause: float, extra_args: list[str]):
+    """Main loop: user enters a prompt, tool repeats it N times."""
 
     workspace = os.path.abspath(workspace)
-    if not os.path.isdir(workspace):
-        print(f"Error: directory does not exist -> {workspace}")
-        return
-
-    detector = ChangeDetector()
-    observer = Observer()
-    observer.schedule(detector, workspace, recursive=True)
-    observer.start()
-    print(f"[DIR]     Monitoring: {workspace}")
-    print(f"[IDLE]    Idle threshold: {idle_timeout}s with no file changes = done")
-    print(f"[HOTKEY]  Chat shortcut: {hotkey}")
+    print(f"[DIR]   Workspace: {workspace}")
+    print(f"[PAUSE] Pause between rounds: {pause}s")
     print(f"Type 'quit' or 'exit' to quit.\n")
 
+    while True:
+        print("=" * 50)
+        try:
+            prompt = input("[PROMPT] Enter instruction: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        if not prompt:
+            print("Prompt cannot be empty.")
+            continue
+        if prompt.lower() in ('quit', 'exit', 'q'):
+            print("Exiting.")
+            break
+
+        try:
+            repeat_input = input("[REPEAT] How many times? (0=infinite, default=1): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+
+        repeat_count = int(repeat_input) if repeat_input else 1
+        label = "infinite" if repeat_count == 0 else str(repeat_count)
+        print(f"\nWill run: {label} time(s). Ctrl+C to stop.\n")
+
+        executed = 0
+        try:
+            while repeat_count == 0 or executed < repeat_count:
+                round_num = executed + 1
+                total = "inf" if repeat_count == 0 else str(repeat_count)
+                print(f"--- Round {round_num}/{total} ---")
+
+                rc = run_agent_once(prompt, workspace, extra_args)
+                executed += 1
+
+                print(f"--- Round {round_num} finished (exit code {rc}) ---\n")
+
+                if repeat_count > 0 and executed >= repeat_count:
+                    break
+
+                if pause > 0:
+                    print(f"Pausing {pause}s before next round...")
+                    time.sleep(pause)
+
+        except KeyboardInterrupt:
+            print(f"\n[STOP] Interrupted after {executed} round(s).")
+
+        print(f"\n[DONE] {executed} round(s) completed.\n")
+
+
+def oneshot(prompt: str, repeat_count: int, workspace: str,
+            pause: float, extra_args: list[str]):
+    """Non-interactive mode: run a given prompt N times and exit."""
+
+    workspace = os.path.abspath(workspace)
+    label = "infinite" if repeat_count == 0 else str(repeat_count)
+    print(f"[DIR]   {workspace}")
+    print(f"[RUNS]  {label}")
+    print(f"[PROMPT] {prompt}\n")
+
+    executed = 0
     try:
-        while True:
-            print("=" * 50)
-            instruction = input("[INPUT] Enter instruction (to send to Cursor): ").strip()
-            if not instruction:
-                print("Instruction cannot be empty, please try again.")
-                continue
-            if instruction.lower() in ('quit', 'exit', 'q'):
-                print("Exiting.")
+        while repeat_count == 0 or executed < repeat_count:
+            round_num = executed + 1
+            total = "inf" if repeat_count == 0 else str(repeat_count)
+            print(f"--- Round {round_num}/{total} ---")
+
+            rc = run_agent_once(prompt, workspace, extra_args)
+            executed += 1
+
+            print(f"--- Round {round_num} finished (exit code {rc}) ---\n")
+
+            if repeat_count > 0 and executed >= repeat_count:
                 break
 
-            repeat_input = input("[REPEAT] How many times? (0=infinite, default=1): ").strip()
-            repeat_count = int(repeat_input) if repeat_input else 1
-
-            label = "infinite" if repeat_count == 0 else str(repeat_count)
-            print(f"\nStarting: repeat {label} time(s)")
-            print(f"Press Ctrl+C to interrupt.\n")
-
-            executed = 0
-            try:
-                while repeat_count == 0 or executed < repeat_count:
-                    round_num = executed + 1
-                    total_str = "inf" if repeat_count == 0 else str(repeat_count)
-                    print(f"  >> Round {round_num}/{total_str} - Sending instruction...")
-
-                    detector.reset()
-
-                    time.sleep(2)
-                    send_to_cursor(instruction, hotkey=hotkey, delay=send_delay)
-
-                    print(f"  [SENT] Instruction sent. Waiting for AI to start...")
-                    ai_started = wait_for_ai_start(detector, timeout=start_wait)
-
-                    if ai_started:
-                        print(f"  [WORKING] AI is working, waiting for it to finish...")
-                        wait_for_ai_finish(detector, idle_timeout=idle_timeout)
-                        print(f"  [DONE] Round {round_num} complete ({detector.change_count} file changes detected)")
-                    else:
-                        print(f"  [WARN] Round {round_num}: no AI activity detected")
-
-                    executed += 1
-
-                    if repeat_count > 0 and executed >= repeat_count:
-                        break
-
-                    time.sleep(1)
-
-            except KeyboardInterrupt:
-                print(f"\n  [STOP] Loop interrupted after {executed} round(s)")
-
-            print(f"\n[RESULT] Task finished: {executed} round(s) completed\n")
+            if pause > 0:
+                print(f"Pausing {pause}s before next round...")
+                time.sleep(pause)
 
     except KeyboardInterrupt:
-        print("\nExiting.")
-    finally:
-        observer.stop()
-        observer.join()
+        print(f"\n[STOP] Interrupted after {executed} round(s).")
+
+    print(f"[DONE] {executed} round(s) completed.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Cursor Looper - Auto-repeat instructions for Cursor AI'
+        description='Cursor Looper - auto-repeat prompts via Cursor CLI agent'
     )
     parser.add_argument(
-        '-w', '--workspace',
-        default='.',
-        help='Workspace directory to monitor (default: current dir)'
+        'prompt', nargs='?', default=None,
+        help='Prompt to send (omit for interactive mode)'
     )
     parser.add_argument(
-        '-t', '--idle-timeout',
-        type=int,
-        default=30,
-        help='Seconds of no file changes before AI is considered done (default: 30)'
+        '-n', '--repeat', type=int, default=1,
+        help='Repeat count (0=infinite, default=1). Used with positional prompt.'
     )
     parser.add_argument(
-        '-k', '--hotkey',
-        default='ctrl+l',
-        help='Hotkey to open Cursor chat (default: ctrl+l)'
+        '-w', '--workspace', default='.',
+        help='Workspace directory (default: current dir)'
     )
     parser.add_argument(
-        '--start-wait',
-        type=int,
-        default=120,
-        help='Seconds to wait for AI to start working (default: 120)'
+        '--pause', type=float, default=2.0,
+        help='Seconds to pause between rounds (default: 2)'
     )
     parser.add_argument(
-        '--send-delay',
-        type=float,
-        default=1.0,
-        help='Delay after pressing chat hotkey before pasting (default: 1.0s)'
+        '--agent-args', nargs=argparse.REMAINDER, default=[],
+        help='Extra arguments forwarded to cursor agent'
     )
 
     args = parser.parse_args()
 
     print_banner()
-    interactive_loop(
-        workspace=args.workspace,
-        idle_timeout=args.idle_timeout,
-        hotkey=args.hotkey,
-        start_wait=args.start_wait,
-        send_delay=args.send_delay,
-    )
+
+    if args.prompt:
+        oneshot(args.prompt, args.repeat, args.workspace,
+                args.pause, args.agent_args)
+    else:
+        interactive_loop(args.workspace, args.pause, args.agent_args)
 
 
 if __name__ == '__main__':
