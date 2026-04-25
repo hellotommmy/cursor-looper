@@ -1,0 +1,6 @@
+---
+pid: 35128
+cwd: |
+  C:\Users\Chengsong\Desktop\cursor_looping
+---
+PS C:\Users\Chengsong\Desktop\cursor_looping>
